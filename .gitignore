@@ -1,0 +1,5 @@
+# Backend (Rust/Actix) build artifacts
+backend/target/
+
+# OS-specific
+.DS_Store
