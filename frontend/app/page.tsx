@@ -24,44 +24,47 @@ export default function Page() {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const [maxRows, setMaxRows] = useState<number>(FALLBACK_MAX_ROWS);
   const [maxCols, setMaxCols] = useState<number>(FALLBACK_MAX_COLS);
+  const maxRowsRef = useRef(maxRows);
+  const maxColsRef = useRef(maxCols);
   const latestSliceRef = useRef<any>(null);
   const selRef = useRef<{ row: number; col: number }>({ row: 0, col: 0 });
+
+  useEffect(() => {
+    maxRowsRef.current = maxRows;
+  }, [maxRows]);
+
+  useEffect(() => {
+    maxColsRef.current = maxCols;
+  }, [maxCols]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const scroller = scrollerRef.current;
     if (!canvas || !scroller) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    let ws: WebSocket | null = null;
+    let rafPending = false;
+    let lastSentKey = "";
+    let reconnectTimer: number | null = null;
+    let destroyed = false;
+    let socketOpen = false;
+
+    const stepHeight = SCROLL_STEP_ROWS * DEFAULT_ROW_HEIGHT;
 
     const resizeAndScale = () => {
       const rect = scroller.getBoundingClientRect();
+      const currentDpr = window.devicePixelRatio || 1;
       // Canvas is fixed-size overlay matching the visible viewport of scroller
       canvas.style.width = `${Math.floor(rect.width)}px`;
       canvas.style.height = `${Math.floor(rect.height)}px`;
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      canvas.width = Math.max(1, Math.floor(rect.width * currentDpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * currentDpr));
       const ctx = canvas.getContext("2d");
       if (ctx) {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.scale(dpr, dpr);
+        ctx.scale(currentDpr, currentDpr);
       }
     };
-
-    resizeAndScale();
-
-    const ws = new WebSocket(WS_URL);
-    let socketOpen = false;
-    let lastSentKey = "";
-    let rafPending = false;
-
-    ws.onopen = () => {
-      socketOpen = true;
-      // First fetch metadata
-      ws.send(JSON.stringify({ type: "metadata_request" }));
-    };
-
-    const stepHeight = SCROLL_STEP_ROWS * DEFAULT_ROW_HEIGHT;
 
     const getViewportSize = () => {
       const rect = scroller.getBoundingClientRect();
@@ -72,7 +75,7 @@ export default function Page() {
 
     const logicalFromVisual = () => {
       const { viewportHeight } = getViewportSize();
-      const totalDatasetHeightPx = maxRows * DEFAULT_ROW_HEIGHT;
+      const totalDatasetHeightPx = maxRowsRef.current * DEFAULT_ROW_HEIGHT;
       const visualScrollable = Math.max(0, MAX_SCROLL_HEIGHT - viewportHeight);
       const logicalScrollable = Math.max(0, totalDatasetHeightPx - viewportHeight);
       if (visualScrollable <= 0 || logicalScrollable <= 0) return 0;
@@ -87,7 +90,7 @@ export default function Page() {
 
     const toVisualScrollTop = (logicalTop: number) => {
       const { viewportHeight } = getViewportSize();
-      const totalDatasetHeightPx = maxRows * DEFAULT_ROW_HEIGHT;
+      const totalDatasetHeightPx = maxRowsRef.current * DEFAULT_ROW_HEIGHT;
       const visualScrollable = Math.max(0, MAX_SCROLL_HEIGHT - viewportHeight);
       const logicalScrollable = Math.max(0, totalDatasetHeightPx - viewportHeight);
       if (logicalScrollable <= 0 || visualScrollable <= 0) return 0;
@@ -123,19 +126,39 @@ export default function Page() {
       });
     };
 
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "metadata_response") {
-        setMaxRows(msg.maxRows ?? FALLBACK_MAX_ROWS);
-        setMaxCols(msg.maxCols ?? FALLBACK_MAX_COLS);
-        // After metadata, request first slice
-        requestSlice();
-        return;
-      }
-      if (msg.type === "slice_response") {
-        latestSliceRef.current = msg;
-        redraw();
-      }
+    const connect = () => {
+      if (destroyed) return;
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
+        socketOpen = true;
+        ws?.send(JSON.stringify({ type: "metadata_request" }));
+      };
+
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "metadata_response") {
+          setMaxRows(msg.maxRows ?? FALLBACK_MAX_ROWS);
+          setMaxCols(msg.maxCols ?? FALLBACK_MAX_COLS);
+          requestSlice();
+          return;
+        }
+        if (msg.type === "slice_response") {
+          latestSliceRef.current = msg;
+          redraw();
+        }
+      };
+
+      ws.onclose = () => {
+        socketOpen = false;
+        if (!destroyed) {
+          reconnectTimer = window.setTimeout(connect, 2000);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error", err);
+      };
     };
 
     const requestSlice = () => {
@@ -157,25 +180,30 @@ export default function Page() {
         defaultRowHeight: DEFAULT_ROW_HEIGHT,
         scrollLeft,
         scrollTop,
-        maxRows,
-        maxCols,
+        maxRows: maxRowsRef.current,
+        maxCols: maxColsRef.current,
       });
       const key = `${slice.startRow}:${slice.rowCount}:${slice.startCol}:${slice.colCount}`;
       if (key === lastSentKey) return;
       lastSentKey = key;
-      ws.send(
-        JSON.stringify({
-          type: "slice_request",
-          screenWidth,
-          screenHeight,
-          horizontalBuffer: H_BUFFER,
-          verticalBuffer: V_BUFFER,
-          defaultColumnWidth: DEFAULT_COLUMN_WIDTH,
-          defaultRowHeight: DEFAULT_ROW_HEIGHT,
-          scrollLeft,
-          scrollTop,
-        })
-      );
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "slice_request",
+            screenWidth,
+            screenHeight,
+            horizontalBuffer: H_BUFFER,
+            verticalBuffer: V_BUFFER,
+            defaultColumnWidth: DEFAULT_COLUMN_WIDTH,
+            defaultRowHeight: DEFAULT_ROW_HEIGHT,
+            scrollLeft,
+            scrollTop,
+          })
+        );
+      } catch (err) {
+        console.error("slice_request failed", err);
+      }
     };
 
     const onResize = () => {
@@ -215,7 +243,7 @@ export default function Page() {
       } else if (row >= startRow + visibleRows) {
         targetLogicalTop = (row + 1) * DEFAULT_ROW_HEIGHT - viewportHeight;
       }
-      const totalDatasetHeightPx = maxRows * DEFAULT_ROW_HEIGHT;
+      const totalDatasetHeightPx = maxRowsRef.current * DEFAULT_ROW_HEIGHT;
       const logicalScrollable = Math.max(0, totalDatasetHeightPx - viewportHeight);
       targetLogicalTop = Math.max(0, Math.min(targetLogicalTop, logicalScrollable));
       targetLogicalTop = quantizeLogical(targetLogicalTop);
@@ -232,7 +260,7 @@ export default function Page() {
       } else if (col >= startCol + visibleCols) {
         targetLeft = (col + 1) * DEFAULT_COLUMN_WIDTH - viewportWidth;
       }
-      const totalWidthPx = maxCols * DEFAULT_COLUMN_WIDTH;
+      const totalWidthPx = maxColsRef.current * DEFAULT_COLUMN_WIDTH;
       targetLeft = Math.max(0, Math.min(targetLeft, Math.max(0, totalWidthPx - viewportWidth)));
       scroller.scrollLeft = targetLeft;
     };
@@ -338,24 +366,27 @@ export default function Page() {
           row = current.startRow + rr;
         }
       };
+      const totalRows = Math.max(1, maxRowsRef.current);
+      const totalCols = Math.max(1, maxColsRef.current);
+
       switch (e.key) {
         case "ArrowUp":
           row = Math.max(0, row - 1);
           break;
         case "ArrowDown":
-          row = Math.min(maxRows - 1, row + 1);
+          row = Math.min(totalRows - 1, row + 1);
           break;
         case "ArrowLeft":
           col = Math.max(0, col - 1);
           break;
         case "ArrowRight":
-          col = Math.min(maxCols - 1, col + 1);
+          col = Math.min(totalCols - 1, col + 1);
           break;
         case "Home":
           col = 0;
           break;
         case "End":
-          col = maxCols - 1;
+          col = totalCols - 1;
           break;
         default:
           // Cmd/Ctrl + Arrow behavior: jump to nearest filled edge within current slice.
@@ -372,15 +403,31 @@ export default function Page() {
     };
     window.addEventListener("keydown", onKeyDown);
 
+    resizeAndScale();
+    connect();
+
     return () => {
       window.removeEventListener("resize", onResize);
       scroller.removeEventListener("scroll", onScroll as any);
       scroller.removeEventListener("mousedown", onMouseDown as any);
       window.removeEventListener("keydown", onKeyDown);
-      ws.close();
+      if (reconnectTimer != null) {
+        clearTimeout(reconnectTimer);
+      }
+      if (ws) {
+        try {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onclose = null;
+          ws.onerror = null;
+          ws.close();
+        } catch (err) {
+          console.error("error closing websocket", err);
+        }
+      }
+      destroyed = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxRows, maxCols]);
+  }, []);
 
   return (
     <div

@@ -136,6 +136,11 @@ async fn handle_socket(mut socket: WebSocket) {
     }
 }
 
+/// Creates a slice response containing a window of spreadsheet data based on the client's viewport.
+/// 
+/// This function calculates which rows and columns should be visible based on the scroll position
+/// and screen dimensions, then generates mock cell data for that window. It applies buffer zones
+/// around the visible area for smooth scrolling and enforces safety limits on the response size.
 fn make_slice_response(req: &SliceRequest) -> SliceResponse {
     let start_row = (req.scroll_top / req.default_row_height as u64) as u64;
     let visible_rows = div_ceil(req.screen_height, req.default_row_height);

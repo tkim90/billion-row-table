@@ -1,5 +1,9 @@
 # Backend (Rust/Actix) build artifacts
-backend/target/
+backend-rust/target/
+
+# Bcakend files
+backend/measurements.idx
+backend/index-build.log
 
 # OS-specific
 .DS_Store
